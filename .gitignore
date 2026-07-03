@@ -10,6 +10,9 @@ zwr_session.json
 # Per-machine scraper state (already-posted event IDs)
 posted_zwiftracing_ecro.txt
 
+# Local Claude Code project settings
+.claude/
+
 # Python
 __pycache__/
 *.pyc
