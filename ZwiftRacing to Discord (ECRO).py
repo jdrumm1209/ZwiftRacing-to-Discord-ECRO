@@ -71,7 +71,16 @@ def wait_for_spa(page, timeout=8000):
         page.wait_for_load_state("networkidle", timeout=timeout)
     except Exception:
         pass
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(500)
+
+def wait_for_results_table(page, timeout=10000):
+    """Wait until the results table has rendered — much faster than
+    waiting for network idle on event pages (usually ready in ~1s)."""
+    try:
+        page.wait_for_selector("table tbody tr", timeout=timeout)
+        page.wait_for_timeout(300)
+    except Exception:
+        wait_for_spa(page)
 
 # -----------------------------
 # SESSION / LOGIN
@@ -270,8 +279,10 @@ def ensure_logged_in(page, max_attempts=3):
     """
     Verify the session; if anonymous, first try the automated Google
     sign-in, then fall back to a manual login in the open Edge window.
+    Lands on the results page so the scrape can start without another
+    navigation.
     """
-    page.goto(ZWR_EVENTS_URL, timeout=30000)
+    page.goto(ZWR_RESULTS_URL, timeout=30000)
     wait_for_spa(page)
 
     if is_logged_in(page):
@@ -350,9 +361,18 @@ def find_ecro_event_ids(page):
                     if el and el.is_visible():
                         el.click()
                         el.fill("")
-                        el.type(EVENT_QUERY, delay=100)
+                        el.type(EVENT_QUERY, delay=50)
+                        first = page.query_selector("a[href*='/events/']")
+                        before = first.get_attribute("href") if first else ""
                         el.press("Enter")
-                        page.wait_for_timeout(3000)
+                        # Poll until the listing actually refilters
+                        # (first link changes) instead of a fixed sleep.
+                        for _ in range(15):
+                            page.wait_for_timeout(200)
+                            cur = page.query_selector("a[href*='/events/']")
+                            cur_href = cur.get_attribute("href") if cur else ""
+                            if cur_href and cur_href != before:
+                                break
                         print(f"  Filtered via {sel}")
                         break
                 except Exception:
@@ -419,40 +439,45 @@ def _text(el):
 def parse_results_table(page):
     """
     Extract a list of rider result dicts from the event page.
-    zwiftracing.app renders a JS table; we try several selector strategies.
+    One evaluate() call pulls the whole table out of the DOM at once —
+    per-cell queries over the driver wire made big pens take seconds.
     """
     results = []
 
-    # Strategy 1: standard <table> rows
-    rows = page.query_selector_all("table tbody tr")
+    raw_rows = page.evaluate(
+        """() => Array.from(document.querySelectorAll('table tbody tr')).map(tr => {
+            const cells = Array.from(tr.querySelectorAll('td'));
+            let riderIdx = -1, rider = '';
+            cells.forEach((c, i) => {
+                if (riderIdx < 0) {
+                    const a = c.querySelector(
+                        "a[href*='/riders/'], a[href*='/rider/'], " +
+                        "a[href*='/athletes/'], a[href*='/profile/']");
+                    if (a) { riderIdx = i; rider = a.innerText.trim(); }
+                }
+            });
+            const teamA = tr.querySelector("a[href*='/teams/']");
+            return {
+                texts: cells.map(c => c.innerText.trim()),
+                riderIdx: riderIdx,
+                rider: rider,
+                teamLink: teamA ? teamA.innerText.trim() : '',
+            };
+        })"""
+    )
 
-    # Strategy 2: div-based virtual table (common in React lists)
-    if not rows:
-        rows = page.query_selector_all(
-            "[class*='result-row'], [class*='ResultRow'], "
-            "[class*='raceResult'], [class*='rider-row']"
-        )
-
-    # Strategy 3: any <tr> that has 3+ <td> children
-    if not rows:
-        rows = page.query_selector_all("tr")
-
-    if not rows:
+    if not raw_rows:
         snippet = page.inner_text("body")[:600].replace("\n", " ")
         print(f"  No results table detected. Page snippet:\n  {snippet}")
         return results
 
-    print(f"  Processing {len(rows)} row(s)…")
+    print(f"  Processing {len(raw_rows)} row(s)…")
 
-    for row in rows:
+    for raw in raw_rows:
         try:
-            cells = row.query_selector_all("td")
-            if len(cells) < 3:
-                cells = row.query_selector_all("[class*='cell'], [class*='col']")
-            if len(cells) < 3:
+            texts = raw["texts"]
+            if len(texts) < 3:
                 continue
-
-            texts = [_text(c) for c in cells]
             # Cells pack extra data on following lines (vELO rating, time
             # gap) — the first line is the value the column displays.
             lines0 = [t.split("\n")[0].strip() for t in texts]
@@ -461,18 +486,9 @@ def parse_results_table(page):
             # vELO ranking value, the Result column comes later) ---
             rank = next((t for t in lines0[1:] if t and _RANK_RE.match(t)), "")
 
-            # --- rider name (prefer a link; remember which cell held it) ---
-            rider = ""
-            rider_idx = None
-            for i, cell in enumerate(cells):
-                el = cell.query_selector(
-                    "a[href*='/riders/'], a[href*='/rider/'], "
-                    "a[href*='/athletes/'], a[href*='/profile/']"
-                )
-                if el:
-                    rider = _text(el).split("\n")[0].strip()
-                    rider_idx = i
-                    break
+            # --- rider name (prefer the rider profile link) ---
+            rider_idx = raw["riderIdx"] if raw["riderIdx"] >= 0 else None
+            rider = raw["rider"].split("\n")[0].strip()
             if not rider:
                 # Fall back: first non-numeric, non-empty cell text of reasonable length
                 for t in lines0[1:]:
@@ -486,41 +502,15 @@ def parse_results_table(page):
                 candidate = lines0[rider_idx + 1]
                 if candidate and not _TIME_RE.match(candidate):
                     team = candidate
-            if not team:
-                for sel in [
-                    "a[href*='/teams/']",
-                    "[class*='team']",
-                    "[class*='Team']",
-                ]:
-                    el = row.query_selector(sel)
-                    if el:
-                        candidate = _text(el)
-                        # Avoid picking up the rider link accidentally
-                        if candidate and candidate != rider:
-                            team = candidate
-                            break
+            if not team and raw["teamLink"] and raw["teamLink"] != rider:
+                team = raw["teamLink"].split("\n")[0].strip()
 
-            # --- category ---
+            # --- category: a lone A-E letter in a cell ---
             race_cat = ""
-            for sel in [
-                "[class*='category']",
-                "[class*='cat-badge']",
-                "[class*='catBadge']",
-                "span[class*='badge']",
-                "[class*='Category']",
-            ]:
-                el = row.query_selector(sel)
-                if el:
-                    t = _text(el).upper()
-                    if len(t) == 1 and t in "ABCDE":
-                        race_cat = t
-                        break
-            # Also check raw cell texts for a single A-E letter
-            if not race_cat:
-                for t in lines0:
-                    if len(t) == 1 and t.upper() in "ABCDE":
-                        race_cat = t.upper()
-                        break
+            for t in lines0:
+                if len(t) == 1 and t.upper() in "ABCDE":
+                    race_cat = t.upper()
+                    break
 
             # --- time + gap to winner (second line of the time cell) ---
             race_time = next((t for t in lines0 if _TIME_RE.match(t)), "")
@@ -583,7 +573,7 @@ def scrape_event(page, event_id, title_hint=""):
 
     try:
         page.goto(url, timeout=30000)
-        wait_for_spa(page)
+        wait_for_results_table(page)
     except Exception as e:
         print(f"  Navigation error: {e}")
         return None
@@ -638,22 +628,6 @@ def scrape_event(page, event_id, title_hint=""):
         parts = [route, _labeled("DISTANCE"), _labeled("ELEVATION")]
         course = "   ".join(p for p in parts if p)
 
-    # --- click Results tab if present ---
-    for sel in [
-        "button:has-text('Results')",
-        "a:has-text('Results')",
-        "[role='tab']:has-text('Results')",
-        "li:has-text('Results')",
-    ]:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                el.click()
-                page.wait_for_timeout(2000)
-                break
-        except Exception:
-            pass
-
     # --- scrape all pens: the event page shows pens A-E as tabs and only
     # loads pen A by default; click through each tab and tag riders with
     # its letter ---
@@ -665,14 +639,29 @@ def scrape_event(page, event_id, title_hint=""):
         if first and first in "ABCDE":
             pen_tabs.append((t, first))
 
+    def _table_sig():
+        try:
+            return page.inner_text("table tbody")[:300]
+        except Exception:
+            return ""
+
     if pen_tabs:
         for tab, cat in pen_tabs:
-            try:
-                tab.click()
-                page.wait_for_timeout(1200)
-            except Exception as e:
-                print(f"  Pen {cat} tab click failed: {e}")
-                continue
+            # The first pen is already loaded — only click the others,
+            # then poll until the table content actually switches
+            # instead of sleeping a fixed amount.
+            if tab.get_attribute("aria-selected") != "true":
+                before = _table_sig()
+                try:
+                    tab.click()
+                except Exception as e:
+                    print(f"  Pen {cat} tab click failed: {e}")
+                    continue
+                for _ in range(12):
+                    page.wait_for_timeout(200)
+                    if _table_sig() != before:
+                        page.wait_for_timeout(150)
+                        break
             pen_results = parse_results_table(page)
             added = 0
             for r in pen_results:
@@ -778,9 +767,11 @@ def fetch_events():
 
         print("  Session active — starting scrape.")
 
-        # Navigate to the results page for scanning
-        page.goto(ZWR_RESULTS_URL, timeout=30000)
-        wait_for_spa(page)
+        # ensure_logged_in already lands on the results page; only
+        # navigate if a login flow left us somewhere else
+        if not page.url.startswith(ZWR_RESULTS_URL):
+            page.goto(ZWR_RESULTS_URL, timeout=30000)
+            wait_for_spa(page)
 
         # Collect ECRO event IDs from the listing pages
         id_hints = find_ecro_event_ids(page)
