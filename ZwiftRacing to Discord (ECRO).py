@@ -445,25 +445,41 @@ def parse_results_table(page):
     results = []
 
     raw_rows = page.evaluate(
-        """() => Array.from(document.querySelectorAll('table tbody tr')).map(tr => {
-            const cells = Array.from(tr.querySelectorAll('td'));
-            let riderIdx = -1, rider = '';
-            cells.forEach((c, i) => {
-                if (riderIdx < 0) {
-                    const a = c.querySelector(
-                        "a[href*='/riders/'], a[href*='/rider/'], " +
-                        "a[href*='/athletes/'], a[href*='/profile/']");
-                    if (a) { riderIdx = i; rider = a.innerText.trim(); }
-                }
+        """() => {
+            // Locate the Result column from the leaf header row — the
+            // finish position must come from Result, never Exp.
+            const theadRows = Array.from(document.querySelectorAll('table thead tr'));
+            const leaf = theadRows.length
+                ? Array.from(theadRows[theadRows.length - 1].querySelectorAll('th')).map(th => th.innerText.trim())
+                : [];
+            let resultIdx = leaf.indexOf('Result');
+            if (resultIdx < 0) resultIdx = 1;
+
+            return Array.from(document.querySelectorAll('table tbody tr')).map(tr => {
+                const cells = Array.from(tr.querySelectorAll('td'));
+                let riderIdx = -1, rider = '';
+                cells.forEach((c, i) => {
+                    if (riderIdx < 0) {
+                        const a = c.querySelector(
+                            "a[href*='/riders/'], a[href*='/rider/'], " +
+                            "a[href*='/athletes/'], a[href*='/profile/']");
+                        if (a) { riderIdx = i; rider = a.innerText.trim(); }
+                    }
+                });
+                const teamA = tr.querySelector("a[href*='/teams/']");
+                const rc = cells[resultIdx];
+                const resultText = rc ? rc.innerText.trim().split('\\n')[0].trim() : '';
+                return {
+                    texts: cells.map(c => c.innerText.trim()),
+                    riderIdx: riderIdx,
+                    rider: rider,
+                    teamLink: teamA ? teamA.innerText.trim() : '',
+                    resultText: resultText,
+                    // Podium places render as a medal icon with no text
+                    hasMedal: rc ? (!resultText && !!rc.querySelector('svg, img')) : false,
+                };
             });
-            const teamA = tr.querySelector("a[href*='/teams/']");
-            return {
-                texts: cells.map(c => c.innerText.trim()),
-                riderIdx: riderIdx,
-                rider: rider,
-                teamLink: teamA ? teamA.innerText.trim() : '',
-            };
-        })"""
+        }"""
     )
 
     if not raw_rows:
@@ -473,6 +489,7 @@ def parse_results_table(page):
 
     print(f"  Processing {len(raw_rows)} row(s)…")
 
+    medal_rank = 0
     for raw in raw_rows:
         try:
             texts = raw["texts"]
@@ -482,9 +499,15 @@ def parse_results_table(page):
             # gap) — the first line is the value the column displays.
             lines0 = [t.split("\n")[0].strip() for t in texts]
 
-            # --- rank: first all-digit cell after cell 0 (cell 0 holds a
-            # vELO ranking value, the Result column comes later) ---
-            rank = next((t for t in lines0[1:] if t and _RANK_RE.match(t)), "")
+            # --- rank: strictly the Result column (the Exp. column next
+            # to it is a prediction, not the finish). Top-3 places show a
+            # medal icon with no text — assign 1/2/3 by display order,
+            # since the default view is sorted by finishing position.
+            rank = raw["resultText"] if _RANK_RE.match(raw["resultText"] or "") else ""
+            if not rank and raw["hasMedal"]:
+                medal_rank += 1
+                if medal_rank <= 3:
+                    rank = str(medal_rank)
 
             # --- rider name (prefer the rider profile link) ---
             rider_idx = raw["riderIdx"] if raw["riderIdx"] >= 0 else None
